@@ -12,6 +12,11 @@ Verifies, over real HTTP:
 5. deadlines: a slow email times out, its batch-mates still succeed, and the
    late result never flips the timeout back to success
 6. early dispatch when the earliest deadline is near
+7. interleaved demo
+8. shadow observation: candidate re-scores accepted emails asynchronously,
+   disagreements are listed with both scores/versions, stopping excludes new
+   emails while included ones keep settling, a slow shadow only affects the
+   comparison status and never occupies online batches
 """
 
 from __future__ import annotations
@@ -155,6 +160,92 @@ def main() -> int:
     slow = next(e for e in new if e["simulate_latency_ms"] > 0)
     check(slow["status"] == "timeout", "demo slow email timed out")
     check(client.get("/healthz").json()["active_model"] == "v2", "demo left v2 active")
+
+    print("8. shadow observation (candidate re-scoring)")
+    client.post("/api/model", json={"version": "v1"})
+    check(client.post("/api/observation/stop").status_code == 409, "stop without observation rejected")
+    started = client.post("/api/observation/start", json={"version": "v2"})
+    check(started.status_code == 201, "observation started on candidate v2")
+    obs_id = started.json()["observation"]["id"]
+    submitted_before = client.get("/api/state").json()["worker"]["metrics"]["submitted"]
+
+    t0 = time.monotonic()
+    shadow_job = client.post(
+        "/api/jobs",
+        json={
+            "label": "shadow",
+            "emails": [
+                {"text": CRYPTO, "deadline_ms": 900},
+                {"text": SPAM, "deadline_ms": 900},
+                {"text": CRYPTO, "deadline_ms": 900, "shadow_simulate_latency_ms": 5000},
+            ],
+        },
+    ).json()
+    shadow_state = wait_job(client, shadow_job["id"])
+    online_elapsed = time.monotonic() - t0
+    check(shadow_state["status"] == "completed", "shadowed job completed online")
+    check(all(e["status"] == "ok" for e in shadow_state["entries"]), "all online conclusions ok")
+    check(online_elapsed < 3.0, f"slow shadow did not delay the online job ({online_elapsed:.2f}s < 3s)")
+    check(all(e["shadow"] for e in shadow_state["entries"]), "all 3 emails pinned to the observation")
+    check(
+        all(e["shadow"]["observation_id"] == obs_id for e in shadow_state["entries"]),
+        "pins reference the active observation",
+    )
+
+    # Stop immediately: the slow shadow (5s > 3s shadow timeout) must still
+    # settle, into the now-stopped observation.
+    stopped = client.post("/api/observation/stop").json()["observation"]
+    check(stopped["id"] == obs_id and stopped["status"] == "stopped", "observation stopped")
+    after_job = client.post(
+        "/api/jobs",
+        json={"label": "post-stop", "emails": [{"text": CRYPTO, "deadline_ms": 900}]},
+    ).json()
+    after_state = wait_job(client, after_job["id"])
+    check(after_state["entries"][0]["shadow"] is None, "email accepted after stop is not shadowed")
+
+    # Wait for the slow shadow to time out, then verify the whole period.
+    deadline = time.monotonic() + 8
+    obs = {}
+    while time.monotonic() < deadline:
+        snapshot = client.get("/api/observation").json()
+        obs = next((o for o in snapshot["observations"] if o["id"] == obs_id), {})
+        if obs and obs.get("pending") == 0:
+            break
+        time.sleep(0.1)
+    check(obs.get("included") == 3, f"observation included exactly 3 emails (got {obs.get('included')})")
+    check(obs.get("pending") == 0, "all included comparisons settled after stop")
+    check(obs.get("shadow_timeout") == 1, "slow shadow recorded as a shadow timeout (comparison status only)")
+    check(obs.get("disagreements", 0) >= 1, "crypto disagreement counted on the observation")
+
+    settled = client.get(f"/api/jobs/{shadow_job['id']}").json()["entries"]
+    crypto = settled[0]
+    check(crypto["label"] == "ham" and crypto["model_version"] == "v1", "online conclusion unchanged (v1 ham)")
+    check(crypto["shadow"]["status"] == "ok", "crypto shadow scored")
+    check(
+        crypto["shadow"]["label"] == "spam" and crypto["shadow"]["candidate_version"] == "v2",
+        "shadow says v2 spam -> opposite labels",
+    )
+    check(crypto["shadow"]["disagree"] is True, "disagreement flagged on the entry")
+    check(
+        crypto["score"] is not None and crypto["shadow"]["score"] is not None,
+        "both online and shadow scores present",
+    )
+    slow_entry = settled[2]
+    check(slow_entry["status"] == "ok", "online conclusion of slow-shadow email is ok")
+    check(slow_entry["shadow"]["status"] == "timeout", "its shadow timed out without touching the online result")
+
+    snapshot = client.get("/api/observation").json()
+    items = snapshot["recent_disagreements"]
+    check(
+        any(i["observation_id"] == obs_id and i["online"]["model_version"] == "v1"
+            and i["shadow"]["model_version"] == "v2" for i in items),
+        "disagreement list carries both versions",
+    )
+    submitted_after = client.get("/api/state").json()["worker"]["metrics"]["submitted"]
+    check(
+        submitted_after - submitted_before == 4,
+        f"shadow scoring never entered online batches (submitted +{submitted_after - submitted_before}, want 4)",
+    )
 
     print()
     if failures:

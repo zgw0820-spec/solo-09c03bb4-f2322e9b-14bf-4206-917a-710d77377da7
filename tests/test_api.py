@@ -20,11 +20,13 @@ def client():
     main_module.jobs.clear()
     main_module.switches.clear()
     main_module.active_version = main_module.registry.default_version
+    main_module.shadow.reset()
     main_module.worker.metrics.update(
         {key: 0 for key in main_module.worker.metrics}
     )
     with TestClient(main_module.app) as test_client:
         yield test_client
+    main_module.shadow.reset()
 
 
 def test_health_and_models(client):

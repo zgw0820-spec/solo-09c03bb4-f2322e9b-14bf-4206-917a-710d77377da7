@@ -58,13 +58,53 @@
 
       <div class="panel">
         <div class="panel-head">
+          <h2>候选模型观察（影子比对）</h2>
+          <span class="spacer"></span>
+          <span class="badge" id="obs-badge">未观察</span>
+        </div>
+        <div class="obs-controls">
+          <select id="obs-version" title="候选版本"></select>
+          <button class="primary" id="obs-start">开启观察</button>
+          <button class="danger" id="obs-stop" disabled>停止观察</button>
+        </div>
+        <p class="small muted" style="margin:0 0 10px">
+          观察期间接单且在线分类成功的邮件，会由候选版本<b>异步</b>再打分；
+          影子慢/失败只影响比对状态，不拖延、不改写在线结论，也不占用在线批次。
+        </p>
+        <div id="obs-active"></div>
+        <div style="margin-top:12px">
+          <h3>最近观察期</h3>
+          <table>
+            <thead>
+              <tr><th>观察期</th><th>候选</th><th>状态</th><th>纳入</th><th>待结算</th><th>相反</th></tr>
+            </thead>
+            <tbody id="obs-list"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:12px">
+          <h3>标签相反（分歧）</h3>
+          <div class="disagree-list" id="disagreements">
+            <div class="empty">尚无分歧</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
           <h2>交错演示</h2>
         </div>
         <p class="small muted" style="margin:0 0 10px">
           一键触发：先以 v1 接单两封 → 切换 v2 → 再提交三封（其中一封模拟慢推理）。
           可直接观察「旧请求用旧模型、新请求立即用新模型、批内不混版本、迟到结果不改判成功」。
         </p>
-        <button class="primary" id="run-demo">运行交错演示</button>
+        <div class="toolbar" style="margin-top:0">
+          <button class="primary" id="run-demo">运行交错演示</button>
+          <button class="primary" id="run-shadow-demo">运行影子观察演示</button>
+        </div>
+        <p class="small muted" style="margin:10px 0 0">
+          影子演示：开启 v2 观察 → 接单三封（一封标签相反、一封影子超慢）→ 停止观察 → 再接单一封。
+          可观察「停止后不再纳入、已纳入继续结算、迟到影子结果仍归原观察期」。
+        </p>
       </div>
     </section>
 

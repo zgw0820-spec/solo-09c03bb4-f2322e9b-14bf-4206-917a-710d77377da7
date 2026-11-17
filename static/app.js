@@ -5,6 +5,7 @@ const state = {
   active: null,
   emails: [],
   jobs: [],
+  observation: null,
   expanded: new Set(),
   pollTimer: null,
 };
@@ -250,6 +251,188 @@ async function switchModel(version) {
   }
 }
 
+// ---------------------------------------------------------------- observation
+const SHADOW_STATUS_LABEL = {
+  waiting: "等待在线结论",
+  pending: "影子打分中",
+  ok: "已完成",
+  timeout: "影子超时",
+  error: "影子失败",
+  skipped: "在线未成功·不比对",
+};
+
+async function refreshObservation() {
+  let data;
+  try {
+    data = await api("/api/observation");
+  } catch (error) {
+    return;
+  }
+  state.observation = data;
+  renderObservation(data);
+}
+
+function renderObservation(data) {
+  const active = data.active;
+  const badge = $("#obs-badge");
+  if (active) {
+    badge.textContent = `观察中 · 候选 ${active.candidate_version}`;
+    badge.className = "badge obs";
+  } else {
+    badge.textContent = "未观察";
+    badge.className = "badge";
+  }
+  $("#obs-stop").disabled = !active;
+  $("#obs-start").textContent = active ? "重新开启（替换当前）" : "开启观察";
+
+  // candidate select: all known versions, default to a non-active one
+  const select = $("#obs-version");
+  const previous = select.value;
+  select.textContent = "";
+  for (const model of state.models) {
+    const option = el("option", null, `${model.version}（阈值 ${model.threshold}）`);
+    option.value = model.version;
+    select.append(option);
+  }
+  const fallback = state.models.find((m) => m.version !== state.active);
+  select.value =
+    previous && state.models.some((m) => m.version === previous)
+      ? previous
+      : (active && active.candidate_version) || (fallback ? fallback.version : "");
+
+  const box = $("#obs-active");
+  box.textContent = "";
+  if (active) {
+    const grid = el("div", "metrics");
+    for (const [key, value] of [
+      ["观察期", active.id],
+      ["候选版本", active.candidate_version],
+      ["已纳入", active.included],
+      ["待结算", active.pending],
+      ["标签相反", active.disagreements],
+      ["影子超时", active.shadow_timeout],
+    ]) {
+      const card = el("div", "metric");
+      card.append(el("div", "k", key));
+      card.append(el("div", "v", String(value ?? 0)));
+      grid.append(card);
+    }
+    box.append(grid);
+    const pairs = (active.pairs || []).join("、") || "—";
+    box.append(
+      el("p", "small muted", `配对（在线→候选）：${pairs} · 开启于 ${fmtTime(active.started_at)}`)
+    );
+  } else {
+    box.append(el("div", "empty", "当前没有进行中的观察。选择候选版本后点击「开启观察」。"));
+  }
+
+  const body = $("#obs-list");
+  body.textContent = "";
+  const observations = data.observations || [];
+  if (!observations.length) {
+    const tr = el("tr");
+    const td = el("td", "muted small", "暂无观察期");
+    td.colSpan = 6;
+    tr.append(td);
+    body.append(tr);
+  }
+  for (const obs of observations) {
+    const tr = el("tr");
+    tr.append(el("td", "mono small", obs.id));
+    const cand = el("td");
+    cand.append(versionPill(obs.candidate_version));
+    tr.append(cand);
+    const status = el("td");
+    status.append(
+      el(
+        "span",
+        "pill " + (obs.status === "active" ? "pending" : "ok"),
+        obs.status === "active" ? "观察中" : "已停止"
+      )
+    );
+    tr.append(status);
+    tr.append(el("td", "num", String(obs.included)));
+    tr.append(el("td", "num", String(obs.pending)));
+    const disagree = el("td", "num");
+    if (obs.disagreements > 0) {
+      disagree.append(el("span", "pill error", String(obs.disagreements)));
+    } else {
+      disagree.textContent = "0";
+    }
+    tr.append(disagree);
+    tr.title =
+      `开启 ${fmtTime(obs.started_at)}` +
+      (obs.stopped_at ? ` · 停止 ${fmtTime(obs.stopped_at)}` : "") +
+      ` · 影子成功 ${obs.shadow_ok} · 影子超时 ${obs.shadow_timeout} · 影子失败 ${obs.shadow_error} · 跳过 ${obs.skipped}`;
+    body.append(tr);
+  }
+
+  const list = $("#disagreements");
+  list.textContent = "";
+  const items = data.recent_disagreements || [];
+  if (!items.length) {
+    list.append(el("div", "empty", "尚无分歧"));
+  }
+  for (const item of items) {
+    const row = el("div", "disagree-item");
+    const head = el("div", "row");
+    head.append(el("span", "mono small muted", `${item.observation_id} · ${item.job_id}#${item.entry_index}`));
+    head.append(el("span", "spacer"));
+    head.append(el("span", "small muted mono", fmtTime(item.at)));
+    row.append(head);
+    const cmp = el("div", "row cmp");
+    cmp.append(el("span", "small muted", "在线"));
+    cmp.append(versionPill(item.online.model_version));
+    cmp.append(el("span", "mono small", fmt(item.online.score, 4)));
+    cmp.append(el("span", "pill " + (item.online.label === "spam" ? "timeout" : "ok"), item.online.label || "—"));
+    cmp.append(el("span", "small muted", "⇄ 影子"));
+    cmp.append(versionPill(item.shadow.model_version));
+    cmp.append(el("span", "mono small", fmt(item.shadow.score, 4)));
+    cmp.append(el("span", "pill " + (item.shadow.label === "spam" ? "timeout" : "ok"), item.shadow.label || "—"));
+    row.append(cmp);
+    const text = el("div", "small muted clamp", item.text || "");
+    text.title = item.text || "";
+    row.append(text);
+    list.append(row);
+  }
+}
+
+async function startObservation() {
+  const version = $("#obs-version").value;
+  if (!version) {
+    toast("请先选择候选版本", true);
+    return;
+  }
+  try {
+    const data = await api("/api/observation/start", {
+      method: "POST",
+      body: JSON.stringify({ version, note: "console observation" }),
+    });
+    toast(
+      data.replaced
+        ? `已重新开启观察 ${data.observation.id}（候选 ${version}，替换 ${data.replaced.id}）`
+        : `已开启观察 ${data.observation.id}（候选 ${version}）`
+    );
+    await refreshObservation();
+  } catch (error) {
+    toast(`开启观察失败：${error.message}`, true);
+  }
+}
+
+async function stopObservation() {
+  try {
+    const data = await api("/api/observation/stop", { method: "POST" });
+    toast(`观察 ${data.observation.id} 已停止；已纳入 ${data.observation.included} 封的比对继续结算`);
+    await refreshObservation();
+  } catch (error) {
+    toast(`停止观察失败：${error.message}`, true);
+  }
+}
+
+function fmtTime(iso) {
+  return iso ? String(iso).slice(11, 19) : "—";
+}
+
 // ---------------------------------------------------------------- state
 async function refreshState() {
   let data;
@@ -351,6 +534,16 @@ function buildJobCard(job) {
   head.append(el("span", "spacer"));
   for (const version of job.versions || []) head.append(versionPill(version));
   head.append(el("span", "small muted", `成功 ${job.ok} · 超时 ${job.timeouts}`));
+  if (job.shadow && job.shadow.pinned > 0) {
+    const shadowBadge = el(
+      "span",
+      "small " + (job.shadow.disagreements > 0 ? "badge bad" : "badge"),
+      job.shadow.disagreements > 0
+        ? `分歧 ${job.shadow.disagreements}`
+        : `影子 ${job.shadow.settled}/${job.shadow.pinned}`
+    );
+    head.append(shadowBadge);
+  }
   if (job.settled !== undefined) {
     head.append(el("span", "small muted", `${job.settled}/${job.size}`));
   }
@@ -368,11 +561,23 @@ function buildJobCard(job) {
   if (job.events && job.events.length) {
     const events = el("div", "events");
     for (const event of job.events) {
-      const label =
-        event.type === "model_switched"
-          ? `切换 ${event.from}→${event.to} @${event.at.slice(11, 19)}`
-          : `接单 #${event.index} → ${event.model_version} @${event.at.slice(11, 19)}`;
-      const cls = event.type === "model_switched" ? "event switch" : "event";
+      let label;
+      let cls = "event";
+      if (event.type === "model_switched") {
+        label = `切换 ${event.from}→${event.to} @${event.at.slice(11, 19)}`;
+        cls = "event switch";
+      } else if (event.type === "observation_started") {
+        label = `观察 ${event.observation_id} 开启 → 候选 ${event.candidate_version} @${event.at.slice(11, 19)}`;
+        cls = "event obs";
+      } else if (event.type === "observation_stopped") {
+        label = `观察 ${event.observation_id} 停止（纳入 ${event.included} · 待结算 ${event.pending}）@${event.at.slice(11, 19)}`;
+        cls = "event obs";
+      } else {
+        label = `接单 #${event.index} → ${event.model_version} @${event.at.slice(11, 19)}`;
+        if (event.shadow_candidate) {
+          label += ` (+影子${event.shadow_candidate}@${event.shadow_observation})`;
+        }
+      }
       const node = el("span", cls, label);
       if (event.pending_old !== undefined) {
         node.textContent += ` (旧版排队 ${event.pending_old})`;
@@ -393,6 +598,8 @@ function buildJobCard(job) {
     "分数",
     "分类",
     "模型",
+    "影子（候选·分数·分类）",
+    "比对",
     "批次",
     "延迟",
     "说明",
@@ -407,12 +614,13 @@ function buildJobCard(job) {
   if (!entries.length) {
     const tr = el("tr");
     const td = el("td", "empty", "结果加载中…");
-    td.colSpan = 10;
+    td.colSpan = 12;
     tr.append(td);
     tbody.append(tr);
   }
   for (const entry of entries) {
-    const tr = el("tr");
+    const shadow = entry.shadow;
+    const tr = el("tr", shadow && shadow.disagree ? "disagree" : null);
     tr.append(el("td", "num", String(entry.index)));
     const textCell = el("td", "text");
     const clamp = el("div", "clamp", entry.text);
@@ -436,6 +644,42 @@ function buildJobCard(job) {
     const versionCell = el("td");
     versionCell.append(versionPill(entry.model_version));
     tr.append(versionCell);
+    // ---- shadow (candidate re-score) ----
+    const shadowCell = el("td");
+    if (shadow) {
+      shadowCell.append(versionPill(shadow.candidate_version));
+      shadowCell.append(document.createTextNode(" "));
+      if (shadow.status === "ok") {
+        shadowCell.append(el("span", "mono small", fmt(shadow.score, 4)));
+        shadowCell.append(document.createTextNode(" "));
+        shadowCell.append(
+          el("span", "pill " + (shadow.label === "spam" ? "timeout" : "ok"), shadow.label)
+        );
+      } else {
+        shadowCell.append(
+          el("span", "small muted", SHADOW_STATUS_LABEL[shadow.status] || shadow.status)
+        );
+      }
+      shadowCell.title = `观察期 ${shadow.observation_id}` +
+        (shadow.latency_ms !== null && shadow.latency_ms !== undefined
+          ? ` · 影子耗时 ${fmt(shadow.latency_ms, 1)}ms`
+          : "") +
+        (shadow.reason ? ` · ${shadow.reason}` : "");
+    } else {
+      shadowCell.append(el("span", "muted", "—"));
+    }
+    tr.append(shadowCell);
+    const cmpCell = el("td");
+    if (shadow && shadow.status === "ok") {
+      cmpCell.append(
+        el("span", "pill " + (shadow.disagree ? "error" : "ok"), shadow.disagree ? "相反" : "一致")
+      );
+    } else if (shadow) {
+      cmpCell.append(el("span", "small muted", SHADOW_STATUS_LABEL[shadow.status] || "…"));
+    } else {
+      cmpCell.append(el("span", "muted", "—"));
+    }
+    tr.append(cmpCell);
     tr.append(el("td", "mono small", entry.batch_id || "—"));
     tr.append(el("td", "num", entry.latency_ms === null || entry.latency_ms === undefined ? "—" : `${fmt(entry.latency_ms, 1)}ms`));
     const noteCell = el("td", "small muted");
@@ -443,6 +687,7 @@ function buildJobCard(job) {
     if (entry.reason) notes.push(entry.reason);
     if (entry.late_result_discarded) notes.push("迟到结果已丢弃");
     if (entry.simulate_latency_ms) notes.push(`模拟延迟 ${entry.simulate_latency_ms}ms`);
+    if (entry.shadow_simulate_latency_ms) notes.push(`影子慢 ${entry.shadow_simulate_latency_ms}ms`);
     if (entry.submit_after_ms) notes.push(`错峰 ${entry.submit_after_ms}ms`);
     noteCell.textContent = notes.join(" · ") || "—";
     tr.append(noteCell);
@@ -518,7 +763,7 @@ function tickClock() {
 
 async function poll() {
   if ($("#auto-refresh").checked) {
-    await Promise.all([refreshState(), refreshJobs()]);
+    await Promise.all([refreshState(), refreshJobs(), refreshObservation()]);
   }
 }
 
@@ -556,6 +801,23 @@ async function runDemo() {
   }
 }
 
+async function runShadowDemo() {
+  const button = $("#run-shadow-demo");
+  button.disabled = true;
+  try {
+    const data = await api("/api/demo/shadow", { method: "POST" });
+    state.expanded.add(data.job.id);
+    toast(`影子演示已启动：观察 ${data.observation.id}（候选 v2），随后停止并再接单`);
+    await refreshJobs(true);
+    await refreshObservation();
+    await refreshState();
+  } catch (error) {
+    toast(`影子演示失败：${error.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function init() {
   fillDemo();
   $("#add-email").onclick = () => {
@@ -573,14 +835,20 @@ function init() {
   };
   $("#submit").onclick = submitEmails;
   $("#run-demo").onclick = runDemo;
+  $("#run-shadow-demo").onclick = runShadowDemo;
+  $("#obs-start").onclick = startObservation;
+  $("#obs-stop").onclick = stopObservation;
   $("#refresh-models").onclick = loadModels;
   $("#auto-refresh").onchange = (event) => {
     if (!event.target.checked) return;
     refreshState();
     refreshJobs();
+    refreshObservation();
   };
 
-  loadModels().catch((error) => toast(`加载模型失败：${error.message}`, true));
+  loadModels()
+    .catch((error) => toast(`加载模型失败：${error.message}`, true))
+    .finally(() => refreshObservation());
   refreshState();
   refreshJobs();
   startPolling();

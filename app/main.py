@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from .batching import Worker
 from .model import ModelRegistry
+from .shadow import ShadowManager, ShadowRecord
 
 logger = logging.getLogger("moderation")
 logging.basicConfig(
@@ -48,6 +49,15 @@ worker = Worker(
     max_batch_size=int(os.environ.get("MAX_BATCH_SIZE", "4")),
     batch_wait_ms=float(os.environ.get("BATCH_WAIT_MS", "200")),
     dispatch_guard_ms=float(os.environ.get("DISPATCH_GUARD_MS", "25")),
+)
+# Shadow (candidate-model) observation.  Runs fully off the online path:
+# its own thread pool, concurrency limit and timeout; it never touches the
+# online worker's queues or batches.
+shadow = ShadowManager(
+    registry,
+    timeout_ms=float(os.environ.get("SHADOW_TIMEOUT_MS", "3000")),
+    max_concurrency=int(os.environ.get("SHADOW_MAX_CONCURRENCY", "4")),
+    thread_workers=int(os.environ.get("SHADOW_THREADS", "2")),
 )
 
 active_version: str = registry.default_version
@@ -99,6 +109,9 @@ class EmailIn(BaseModel):
     # timing of this individual message, never the batching contract.
     submit_after_ms: int = Field(default=0, ge=0, le=5000)
     simulate_latency_ms: int = Field(default=0, ge=0, le=5000)
+    # Demo-only: slow down the *shadow* re-score of this email (never the
+    # online path) to show that a slow shadow only affects comparison status.
+    shadow_simulate_latency_ms: int = Field(default=0, ge=0, le=10000)
 
 
 class SubmitIn(BaseModel):
@@ -107,6 +120,11 @@ class SubmitIn(BaseModel):
 
 
 class SwitchIn(BaseModel):
+    version: str
+    note: str | None = Field(default=None, max_length=200)
+
+
+class ObservationStartIn(BaseModel):
     version: str
     note: str | None = Field(default=None, max_length=200)
 
@@ -121,9 +139,12 @@ class JobEntry:
     deadline_ms: int
     submit_after_ms: int
     simulate_latency_ms: int
+    shadow_simulate_latency_ms: int = 0
     model_version: str | None = None
     accepted_at: str | None = None
     result: dict | None = None
+    # Pinned at intake when an observation is active; never re-targeted.
+    shadow: ShadowRecord | None = None
 
     def public(self) -> dict:
         result = self.result or {}
@@ -133,6 +154,7 @@ class JobEntry:
             "deadline_ms": self.deadline_ms,
             "submit_after_ms": self.submit_after_ms,
             "simulate_latency_ms": self.simulate_latency_ms,
+            "shadow_simulate_latency_ms": self.shadow_simulate_latency_ms,
             "model_version": self.model_version,
             "accepted_at": self.accepted_at,
             "status": result.get("status", "accepted"),
@@ -146,6 +168,7 @@ class JobEntry:
             "late_result_discarded": result.get("late_result_discarded", False),
             "submitted_at": result.get("submitted_at"),
             "completed_at": result.get("completed_at"),
+            "shadow": self.shadow.public() if self.shadow else None,
         }
 
 
@@ -163,6 +186,7 @@ class Job:
 
     def public(self, *, include_entries: bool = True) -> dict:
         versions = sorted({e.model_version for e in self.entries if e.model_version})
+        shadowed = [e for e in self.entries if e.shadow is not None]
         data = {
             "id": self.id,
             "label": self.label,
@@ -182,6 +206,13 @@ class Job:
                 1 for e in self.entries if (e.result or {}).get("status") == "error"
             ),
             "versions": versions,
+            "shadow": {
+                "pinned": len(shadowed),
+                "settled": sum(
+                    1 for e in shadowed if e.shadow.status in ("ok", "timeout", "error", "skipped")
+                ),
+                "disagreements": sum(1 for e in shadowed if e.shadow.disagree),
+            },
         }
         if include_entries:
             data["entries"] = [e.public() for e in self.entries]
@@ -196,6 +227,58 @@ def _prune_jobs() -> None:
         jobs.pop(jid, None)
 
 
+def _accept_entry(job: Job, entry: JobEntry) -> asyncio.Task:
+    """Intake one email: pin the active model *and* the active observation.
+
+    Both pins happen here, synchronously, at acceptance time.  From then on
+    the (online model, candidate model) pairing of this email is frozen —
+    later model switches or observation restarts never retarget it.
+    """
+    version = active_version
+    entry.model_version = version
+    entry.accepted_at = _now_iso()
+    record = shadow.pin(version)
+    if record is not None:
+        entry.shadow = record
+    event: dict[str, Any] = {
+        "at": entry.accepted_at,
+        "type": "accepted",
+        "index": entry.index,
+        "model_version": version,
+    }
+    if record is not None:
+        event["shadow_observation"] = record.observation_id
+        event["shadow_candidate"] = record.candidate_version
+    job.events.append(event)
+    coro = worker.submit(
+        text=entry.text,
+        model_version=version,
+        deadline_ms=entry.deadline_ms,
+        request_id=f"{job.id}-{entry.index}",
+        request_batch_id=job.id,
+        latency_sim_ms=entry.simulate_latency_ms,
+    )
+    return asyncio.create_task(coro)
+
+
+def _settle_entry(job: Job, entry: JobEntry, result: Any) -> None:
+    """Store the final online conclusion, then maybe schedule the shadow.
+
+    The shadow is fire-and-forget: it is only ever *scheduled* here, never
+    awaited, so it cannot delay the online job, and it writes only to the
+    entry's shadow record, never to the online result.
+    """
+    if isinstance(result, BaseException):
+        entry.result = {
+            "status": "error",
+            "reason": "gateway_error",
+            "detail": str(result),
+        }
+    else:
+        entry.result = result
+    shadow.on_online_result(job, entry)
+
+
 async def _run_job(job: Job) -> None:
     job.status = "running"
     job.started_at = _now_iso()
@@ -206,37 +289,10 @@ async def _run_job(job: Job) -> None:
             delay = start + entry.submit_after_ms / 1000.0 - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
-            # ---- intake: pin the version that is active right now ----
-            version = active_version
-            entry.model_version = version
-            entry.accepted_at = _now_iso()
-            job.events.append(
-                {
-                    "at": entry.accepted_at,
-                    "type": "accepted",
-                    "index": entry.index,
-                    "model_version": version,
-                }
-            )
-            coro = worker.submit(
-                text=entry.text,
-                model_version=version,
-                deadline_ms=entry.deadline_ms,
-                request_id=f"{job.id}-{entry.index}",
-                request_batch_id=job.id,
-                latency_sim_ms=entry.simulate_latency_ms,
-            )
-            tasks.append(asyncio.create_task(coro))
+            tasks.append(_accept_entry(job, entry))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for entry, result in zip(job.entries, results):
-            if isinstance(result, BaseException):
-                entry.result = {
-                    "status": "error",
-                    "reason": "gateway_error",
-                    "detail": str(result),
-                }
-            else:
-                entry.result = result
+            _settle_entry(job, entry, result)
         job.status = "completed"
     except asyncio.CancelledError:
         job.status = "cancelled"
@@ -263,6 +319,7 @@ def _new_job(payload: SubmitIn, *, prefix: str = "job") -> Job:
                 deadline_ms=email.deadline_ms,
                 submit_after_ms=email.submit_after_ms,
                 simulate_latency_ms=email.simulate_latency_ms,
+                shadow_simulate_latency_ms=email.shadow_simulate_latency_ms,
             )
             for i, email in enumerate(payload.emails)
         ],
@@ -277,6 +334,7 @@ def _new_job(payload: SubmitIn, *, prefix: str = "job") -> Job:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await worker.start()
+    await shadow.start()
     logger.info(
         "models loaded: %s (active=%s, model_dir=%s)",
         ", ".join(registry.versions),
@@ -286,6 +344,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await shadow.stop()
         await worker.stop()
 
 
@@ -352,6 +411,7 @@ async def state() -> dict:
         "models": registry.versions,
         "switches": list(reversed(switches[-20:])),
         "worker": worker.snapshot(),
+        "observation": shadow.active.public() if shadow.active else None,
         "config": {
             "max_batch_size": worker.max_batch_size,
             "batch_wait_ms": worker.batch_wait_s * 1000,
@@ -365,6 +425,58 @@ async def state() -> dict:
         "server_time": _now_iso(),
         "pending": worker.pending_count(),
     }
+
+
+# ---------------------------------------------------------------------------
+# shadow observation (candidate model re-scoring)
+# ---------------------------------------------------------------------------
+@app.get("/api/observation")
+async def get_observation() -> dict:
+    return shadow.snapshot()
+
+
+@app.post("/api/observation/start", status_code=201)
+async def start_observation(payload: ObservationStartIn) -> dict:
+    """Open an observation period on a candidate version.
+
+    If one is already active it is stopped first (a "restart"): emails
+    accepted from this moment pair the *current* active model with the new
+    candidate, while emails accepted earlier keep their original pairing.
+    """
+    if payload.version not in registry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"未知模型版本 {payload.version!r}，可用: {registry.versions}",
+        )
+    obs, previous = shadow.start_observation(payload.version)
+    logger.info(
+        "observation %s started by console (candidate=%s, replaced=%s, note=%s)",
+        obs.id,
+        payload.version,
+        previous.id if previous else None,
+        payload.note,
+    )
+    return {
+        "observation": obs.public(),
+        "replaced": previous.public() if previous else None,
+        "active_model": active_version,
+    }
+
+
+@app.post("/api/observation/stop")
+async def stop_observation() -> dict:
+    """Close the active period.  Already-pinned emails keep settling."""
+    try:
+        obs = shadow.stop_observation()
+    except LookupError:
+        raise HTTPException(status_code=409, detail="当前没有进行中的观察") from None
+    logger.info(
+        "observation %s stopped by console (included=%d, pending=%d)",
+        obs.id,
+        obs.included,
+        obs.pending,
+    )
+    return {"observation": obs.public()}
 
 
 @app.post("/api/jobs", status_code=202)
@@ -449,29 +561,7 @@ async def demo_interleaved() -> dict:
         tasks: list[asyncio.Task] = []
         try:
             for entry in job.entries[: len(old_emails)]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
+                tasks.append(_accept_entry(job, entry))
             await asyncio.sleep(max(0.0, start + 0.06 - time.monotonic()))
             event = _set_active(
                 "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
@@ -487,39 +577,10 @@ async def demo_interleaved() -> dict:
             )
             await asyncio.sleep(max(0.0, start + 0.10 - time.monotonic()))
             for entry in job.entries[len(old_emails) :]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
+                tasks.append(_accept_entry(job, entry))
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for entry, result in zip(job.entries, results):
-                if isinstance(result, BaseException):
-                    entry.result = {
-                        "status": "error",
-                        "reason": "gateway_error",
-                        "detail": str(result),
-                    }
-                else:
-                    entry.result = result
+                _settle_entry(job, entry, result)
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -531,6 +592,97 @@ async def demo_interleaved() -> dict:
 
     _spawn(orchestrate(), name=f"demo-runner-{job.id}")
     return job.public()
+
+
+@app.post("/api/demo/shadow")
+async def demo_shadow() -> dict:
+    """Observation demo: start on v2, accept emails, stop, accept one more.
+
+    Timeline (active model is switched to v1 first):
+      1. observation opens on candidate v2
+      2. three emails are accepted *during* the observation — one of them
+         (crypto) flips label between v1 and v2, and one is given an
+         artificially slow shadow so its comparison settles late
+      3. the observation is stopped while the slow shadow is still running
+      4. one more email is accepted *after* the stop — it gets no shadow
+
+    Shows: intake-time pairing, disagreement listing, "no new emails after
+    stop", and "late shadow results still settle into the original period".
+    The online conclusions are never delayed by the slow shadow.
+    """
+    if "v1" not in registry or "v2" not in registry:
+        raise HTTPException(status_code=409, detail="demo 需要 v1 与 v2 两个模型")
+    _set_active("v1", source="demo", note="影子演示：先切回 v1")
+    obs, _previous = shadow.start_observation("v2")
+
+    emails = [
+        # Disagreement expected: ham under v1, spam under v2.
+        EmailIn(
+            text="Limited offer! Invest in crypto today and double your money fast.",
+            deadline_ms=900,
+        ),
+        EmailIn(
+            text="Congratulations! You are a winner. Claim your free prize now, click here.",
+            deadline_ms=900,
+        ),
+        # Slow shadow: settles (as a shadow timeout) only after the stop.
+        EmailIn(
+            text="Your parcel could not be delivered. Pay the small fee to reschedule.",
+            deadline_ms=900,
+            shadow_simulate_latency_ms=5000,
+        ),
+        # Accepted after the stop: must NOT be shadowed.
+        EmailIn(
+            text="Final notice: send your password to unlock the refund.",
+            deadline_ms=900,
+        ),
+    ]
+    job = _new_job(SubmitIn(label="影子观察演示", emails=emails), prefix="demo")
+
+    async def orchestrate() -> None:
+        job.status = "running"
+        job.started_at = _now_iso()
+        start = time.monotonic()
+        tasks: list[asyncio.Task] = []
+        try:
+            job.events.append(
+                {
+                    "at": _now_iso(),
+                    "type": "observation_started",
+                    "observation_id": obs.id,
+                    "candidate_version": obs.candidate_version,
+                }
+            )
+            for entry in job.entries[:3]:
+                tasks.append(_accept_entry(job, entry))
+            # Stop the observation while email #3's shadow is still running.
+            await asyncio.sleep(max(0.0, start + 0.15 - time.monotonic()))
+            stopped = shadow.stop_observation()
+            job.events.append(
+                {
+                    "at": stopped.stopped_at,
+                    "type": "observation_stopped",
+                    "observation_id": stopped.id,
+                    "included": stopped.included,
+                    "pending": stopped.pending,
+                }
+            )
+            await asyncio.sleep(max(0.0, start + 0.20 - time.monotonic()))
+            tasks.append(_accept_entry(job, job.entries[3]))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for entry, result in zip(job.entries, results):
+                _settle_entry(job, entry, result)
+            job.status = "completed"
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.error = "shutdown"
+            raise
+        finally:
+            job.finished_at = _now_iso()
+            _prune_jobs()
+
+    _spawn(orchestrate(), name=f"demo-shadow-{job.id}")
+    return {"job": job.public(), "observation": obs.public()}
 
 
 @app.exception_handler(ValueError)

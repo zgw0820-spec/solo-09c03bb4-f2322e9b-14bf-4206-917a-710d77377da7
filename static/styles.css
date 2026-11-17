@@ -62,6 +62,7 @@ h3 { font-size: 12px; margin: 0 0 8px; color: var(--muted); text-transform: uppe
 .badge.active { border-color: #2f6f57; background: #10291f; color: var(--accent-2); }
 .badge.warn { border-color: #6b5a23; background: #2a2412; color: var(--warn); }
 .badge.bad { border-color: #6e2f2f; background: #2a1616; color: var(--bad); }
+.badge.obs { border-color: #42356b; background: #1a1530; color: #b8a6ff; }
 
 .spacer { flex: 1; }
 
@@ -238,6 +239,32 @@ td.text .clamp {
   padding: 2px 7px;
 }
 .event.switch { color: var(--warn); border-color: #5b4a1d; }
+.event.obs { color: #b8a6ff; border-color: #42356b; }
+
+tr.disagree { background: rgba(255, 122, 122, 0.07); }
+tr.disagree:hover { background: rgba(255, 122, 122, 0.12); }
+
+.obs-controls { display: flex; gap: 8px; margin-bottom: 10px; }
+.obs-controls select { flex: 1; min-width: 0; }
+.obs-controls button { white-space: nowrap; }
+
+.disagree-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
+.disagree-item {
+  border: 1px solid #5c2c2c;
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: #17121a;
+  display: grid;
+  gap: 4px;
+}
+.disagree-item .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.disagree-item .cmp { font-size: 12px; }
+.disagree-item .clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; }
 .metric {

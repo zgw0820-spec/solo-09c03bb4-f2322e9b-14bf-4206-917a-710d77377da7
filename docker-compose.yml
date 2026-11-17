@@ -14,6 +14,11 @@ services:
       BATCH_WAIT_MS: "200"
       DISPATCH_GUARD_MS: "25"
       MAX_EMAILS_PER_SUBMISSION: "16"
+      # Shadow (candidate-model) observation: fully isolated from the online
+      # path — own thread pool, concurrency cap and timeout.
+      SHADOW_TIMEOUT_MS: "3000"
+      SHADOW_MAX_CONCURRENCY: "4"
+      SHADOW_THREADS: "2"
       LOG_LEVEL: INFO
     volumes:
       # Two distinct English bag-of-words models are baked into the image and
